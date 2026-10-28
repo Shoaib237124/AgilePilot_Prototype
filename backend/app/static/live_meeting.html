@@ -1,0 +1,380 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgilePilot Live Meeting</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 900px;
+      margin: 35px auto;
+      padding: 0 18px;
+      color: #202124;
+      background: #f7f8fa;
+    }
+
+    .card {
+      background: white;
+      padding: 24px;
+      border-radius: 12px;
+      border: 1px solid #ddd;
+      margin-bottom: 18px;
+    }
+
+    input {
+      display: block;
+      box-sizing: border-box;
+      width: 100%;
+      padding: 11px;
+      margin: 8px 0 16px;
+    }
+
+    button {
+      padding: 11px 18px;
+      margin-right: 8px;
+      border: 0;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    #startButton { background: #1769aa; color: white; }
+    #stopButton { background: #b42318; color: white; }
+    #stopButton:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    #status {
+      font-weight: bold;
+      margin-bottom: 12px;
+    }
+
+    #transcript {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      min-height: 180px;
+      max-height: 420px;
+      overflow-y: auto;
+      line-height: 1.6;
+    }
+
+    .muted { color: #666; }
+  </style>
+</head>
+
+<body>
+  <h1>AgilePilot Live Meeting Bot</h1>
+  <p class="muted">
+    Start a meeting, view live transcription, and generate
+    the project documents when the meeting ends.
+  </p>
+
+  <div class="card">
+    <label for="meetingId">Existing Meeting ID (UUID)</label>
+    <input id="meetingId" placeholder="Enter an existing meeting UUID">
+
+    <label for="projectId">Project ID (UUID)</label>
+    <input id="projectId" placeholder="Enter the project's UUID">
+
+    <button id="startButton">Start Meeting</button>
+    <button id="stopButton" disabled>Stop Meeting</button>
+
+    <p id="status">Status: Not connected</p>
+  </div>
+
+  <div class="card">
+    <h2>Live Transcript</h2>
+    <div id="transcript">Your transcript will appear here...</div>
+  </div>
+
+  <div class="card">
+    <h2>Activity Log</h2>
+    <div id="activity" class="muted"></div>
+  </div>
+
+<script>
+  const startButton = document.getElementById("startButton");
+  const stopButton = document.getElementById("stopButton");
+  const statusElement = document.getElementById("status");
+  const transcriptElement = document.getElementById("transcript");
+  const activityElement = document.getElementById("activity");
+
+  let socket = null;
+  let mediaStream = null;
+  let audioContext = null;
+  let processor = null;
+  let source = null;
+  let finalizedText = "";
+  let currentInterim = "";
+
+  function setStatus(message) {
+    statusElement.textContent = "Status: " + message;
+  }
+
+  function log(message) {
+    const line = document.createElement("p");
+    line.textContent = message;
+    activityElement.prepend(line);
+  }
+
+  function renderTranscript() {
+    transcriptElement.textContent =
+      finalizedText + (currentInterim ? "\n" + currentInterim : "");
+    transcriptElement.scrollTop = transcriptElement.scrollHeight;
+  }
+
+  // Convert browser Float32 audio into signed 16-bit PCM at 16 kHz.
+  function toPCM16(input, inputRate, targetRate = 16000) {
+    if (inputRate < targetRate) {
+      throw new Error("Audio sample rate must be at least 16000 Hz.");
+    }
+
+    const ratio = inputRate / targetRate;
+    const outputLength = Math.floor(input.length / ratio);
+    const output = new Int16Array(outputLength);
+
+    for (let i = 0; i < outputLength; i++) {
+      const start = Math.floor(i * ratio);
+      const end = Math.min(
+        Math.floor((i + 1) * ratio),
+        input.length
+      );
+
+      let sum = 0;
+      for (let j = start; j < end; j++) {
+        sum += input[j];
+      }
+
+      let sample = sum / Math.max(1, end - start);
+      sample = Math.max(-1, Math.min(1, sample));
+
+      output[i] = sample < 0
+        ? sample * 32768
+        : sample * 32767;
+    }
+
+    return output;
+  }
+
+  async function startAudio() {
+    audioContext = new AudioContext();
+
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    if (audioContext.sampleRate < 16000) {
+      throw new Error("Browser audio sample rate is too low.");
+    }
+
+    source = audioContext.createMediaStreamSource(mediaStream);
+
+    // ScriptProcessorNode is used here for a simple coursework
+    // prototype. AudioWorklet is preferable for production.
+    processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = (event) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      const input = event.inputBuffer.getChannelData(0);
+      const pcm = toPCM16(input, audioContext.sampleRate);
+
+      if (pcm.length > 0) {
+        socket.send(pcm.buffer);
+      }
+    };
+
+    source.connect(processor);
+
+    // Connect through a zero-gain node to process audio without
+    // playing microphone audio back through the speakers.
+    const silentOutput = audioContext.createGain();
+    silentOutput.gain.value = 0;
+
+    processor.connect(silentOutput);
+    silentOutput.connect(audioContext.destination);
+  }
+
+  function stopAudioCapture() {
+    if (processor) {
+      processor.disconnect();
+      processor.onaudioprocess = null;
+      processor = null;
+    }
+
+    if (source) {
+      source.disconnect();
+      source = null;
+    }
+
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(track => track.stop());
+      mediaStream = null;
+    }
+
+    if (audioContext) {
+      audioContext.close().catch(() => {});
+      audioContext = null;
+    }
+  }
+
+  startButton.addEventListener("click", async () => {
+    const meetingId = document.getElementById("meetingId").value.trim();
+    const projectId = document.getElementById("projectId").value.trim();
+
+    if (!meetingId || !projectId) {
+      alert("Enter both Meeting ID and Project ID.");
+      return;
+    }
+
+    try {
+      startButton.disabled = true;
+      setStatus("Requesting microphone permission...");
+
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl =
+        `${protocol}//${location.host}/ws/live-meeting/${encodeURIComponent(meetingId)}`;
+
+      socket = new WebSocket(wsUrl);
+      socket.binaryType = "arraybuffer";
+
+      socket.onopen = () => {
+        socket.send(JSON.stringify({
+          type: "start",
+          project_id: projectId
+        }));
+      };
+
+      socket.onmessage = async (event) => {
+        let data;
+
+        try {
+          data = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+
+        if (data.type === "ready") {
+          try {
+            await startAudio();
+            setStatus("Recording and transcribing");
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            log("Live transcription started.");
+          } catch (error) {
+            log("Audio initialization failed: " + error.message);
+            stopAudioCapture();
+
+            if (socket && socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: "stop" }));
+            }
+          }
+        }
+
+        if (data.type === "transcript") {
+          const speaker = data.speaker_id === 0
+            ? "Speaker 0"
+            : data.speaker_id === 1
+              ? "Speaker 1"
+              : "Speaker";
+
+          const line = `${speaker}: ${data.text}`;
+
+          if (data.is_final) {
+            finalizedText += line + "\n";
+            currentInterim = "";
+          } else {
+            currentInterim = line + " ...";
+          }
+
+          renderTranscript();
+        }
+
+        if (data.type === "transcript_saved") {
+          log(`Transcript saved: ${data.segment_count} segments.`);
+          setStatus("Transcript saved; generating documents...");
+        }
+
+        if (data.type === "documents_generated") {
+          setStatus("Meeting processing completed.");
+          log("Document generation workflow finished.");
+
+          if (data.notion_page_url) {
+            const link = document.createElement("a");
+            link.href = data.notion_page_url;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "Open Notion documentation";
+            activityElement.prepend(link);
+          }
+
+          if (data.consistency_score !== null &&
+              data.consistency_score !== undefined) {
+            log("Consistency score: " + data.consistency_score);
+          }
+        }
+
+        if (data.type === "documents_failed") {
+          setStatus("Transcript saved; document generation failed.");
+          log(data.message);
+        }
+
+        if (data.type === "meeting_finished") {
+          setStatus("Meeting finished.");
+          stopAudioCapture();
+          startButton.disabled = false;
+          stopButton.disabled = true;
+          log(data.message);
+        }
+
+        if (data.type === "error") {
+          setStatus("Error");
+          log(data.message);
+        }
+      };
+
+      socket.onerror = () => {
+        setStatus("WebSocket error");
+        log("Check the backend terminal for the connection error.");
+      };
+
+      socket.onclose = () => {
+        stopAudioCapture();
+        startButton.disabled = false;
+        stopButton.disabled = true;
+      };
+
+    } catch (error) {
+      stopAudioCapture();
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      setStatus("Could not start");
+      log(error.message);
+    }
+  });
+
+  stopButton.addEventListener("click", () => {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      // Stop sending audio first, then request finalization.
+      stopAudioCapture();
+      socket.send(JSON.stringify({ type: "stop" }));
+
+      stopButton.disabled = true;
+      setStatus("Finishing transcription...");
+      log("Stop requested. Waiting for final transcript and documents.");
+    }
+  });
+</script>
+</body>
+</html>

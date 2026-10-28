@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-dotenv
+sqlalchemy
+psycopg2-binary
+requests
+pydantic
+langgraph
+langgraph-checkpoint-postgres
+langchain-core
+langchain-groq
+psycopg[binary]
+websockets>=14,<15
